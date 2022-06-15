@@ -7,6 +7,10 @@ import numpy as np
 EPS = 1e-17
 NEG_INF = -1e30
 
+def stable_log(x, eps=10e-6):
+    # logs are slightly modified for numerical stability
+    # return torch.log(torch.clamp(x, min=eps))
+    return torch.log(torch.add(x, eps))
 
 def to_one_hot(indices, max_index):
     """Get one-hot encoding of index tensors."""
@@ -99,7 +103,7 @@ def get_segment_probs(all_b_samples, all_masks, segment_id):
         return neg_cumsum
 
 
-def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, prior_rate=3.,):
+def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, beta_entropy=5., prior_rate=3.,):
     """Get losses (NLL, KL divergences and neg. ELBO).
 
     Args:
@@ -111,9 +115,9 @@ def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, prior_rate=3.,):
         prior_rate: Rate (lambda) for Poisson prior.
     """
 
-    targets = inputs.view(-1)
+    targets = inputs[1].view(-1)
     all_encs, all_recs, all_masks, all_b, all_z = outputs
-    input_dim = args.num_symbols + 1
+    input_dim = all_recs[0].size(2)
 
     nll = 0.
     kl_z = 0.
@@ -122,7 +126,7 @@ def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, prior_rate=3.,):
             all_b['samples'], all_masks, seg_id)
         preds = all_recs[seg_id].view(-1, input_dim)
         seg_loss = F.cross_entropy(
-            preds, targets, reduction='none').view(-1, inputs.size(1))
+            preds, targets, reduction='none').view(-1, inputs[0].size(1))
 
         # Ignore EOS token (last sequence element) in loss.
         nll += (seg_loss[:, :-1] * seg_prob[:, :-1]).sum(1).mean(0)
@@ -140,13 +144,18 @@ def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, prior_rate=3.,):
 
     # KL divergence on b (first segment only, ignore first time step).
     # TODO(tkipf): Implement alternative prior on soft segment length.
-    probs_b = F.softmax(all_b['logits'][0], dim=-1)
-    log_prior_b = poisson_categorical_log_prior(
-        probs_b.size(1), prior_rate, device=inputs.device)
-    kl_b = args.num_segments * kl_categorical(
-        probs_b[:, 1:], log_prior_b[:, 1:]).mean(0)
+    if args.num_segments > 1:
+        probs_b = F.softmax(all_b['logits'][0], dim=-1)
+        log_prior_b = poisson_categorical_log_prior(
+            probs_b.size(1), prior_rate, device=inputs[0].device)
+        kl_b = model.num_segments * kl_categorical(
+            probs_b[:, 1:], log_prior_b[:, 1:]).mean(0)
+    else:
+        kl_b = 0
 
-    loss = nll + beta_z * kl_z + beta_b * kl_b
+    entropy = torch.sum(all_z['samples'][0].mean(0) * stable_log(all_z['samples'][0].mean(0)))
+
+    loss = nll + beta_z * kl_z + beta_b * kl_b + beta_entropy * entropy
     return loss, nll, kl_z, kl_b
 
 
@@ -155,7 +164,7 @@ def get_reconstruction_accuracy(inputs, outputs, args):
 
     all_encs, all_recs, all_masks, all_b, all_z = outputs
 
-    batch_size = inputs.size(0)
+    batch_size = inputs[0].size(0)
 
     rec_seq = []
     rec_acc = 0.
@@ -173,7 +182,44 @@ def get_reconstruction_accuracy(inputs, outputs, args):
             prev_boundary_pos = boundary_pos
         rec_seq.append(torch.cat(rec_seq_parts))
         cur_length = rec_seq[sample_idx].size(0)
-        matches = rec_seq[sample_idx] == inputs[sample_idx, :cur_length]
+        matches = rec_seq[sample_idx] == inputs[1][sample_idx, :cur_length]
         rec_acc += matches.float().mean()
     rec_acc /= batch_size
     return rec_acc, rec_seq
+
+class PermManager:
+
+    # helper class for batching
+    def __init__(self, n, batch_size, perm=None, perm_index=0, epoch=0):
+        self.n = n
+        self.batch_size = batch_size
+        if perm is None:
+            self.perm = np.random.permutation(self.n)
+        else:
+            self.perm = perm
+        self.perm_index = perm_index
+        self.epoch = epoch
+
+    def get_indices(self):
+        indices = np.zeros(shape=(self.batch_size,), dtype=np.int32)
+        n_stored = 0
+        while n_stored < self.batch_size:
+            # Take either to end of batch or end of epoch, whichever comes first
+            n_to_take = min(self.batch_size - n_stored, self.n - self.perm_index)
+            indices[n_stored: n_stored + n_to_take] = \
+                self.perm[self.perm_index: self.perm_index + n_to_take]
+            # Update these to reflect elements taken from this epoch
+            self.perm_index += n_to_take
+            n_stored += n_to_take
+            # If this assertion is violated this method must be incorrect
+            assert self.perm_index <= self.n
+            # Reshuffle indices and reset perm_index if we have reached the end of an epoch
+            if self.perm_index == self.n:
+                self.perm_index = 0
+                self.epoch += 1
+                self.perm = np.random.permutation(self.n)
+
+        # If this is violated then this method is incorrect
+        assert n_stored == self.batch_size
+
+        return indices

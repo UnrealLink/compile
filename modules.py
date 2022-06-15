@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 import utils
 
@@ -18,23 +19,31 @@ class CompILE(nn.Module):
         latent_dist: Whether to use Gaussian latents ('gaussian') or concrete /
             Gumbel softmax latents ('concrete').
     """
-    def __init__(self, input_dim, hidden_dim, latent_dim, max_num_segments,
-                 temp_b=1., temp_z=1., latent_dist='gaussian'):
+    def __init__(self, state_dim, action_dim, hidden_dim, latent_dim, max_num_segments,
+                 temp_b=1., temp_z=1., latent_dist='gaussian', device='cpu'):
         super(CompILE, self).__init__()
 
-        self.input_dim = input_dim
+        self.state_dim = state_dim
+        self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.max_num_segments = max_num_segments
         self.temp_b = temp_b
         self.temp_z = temp_z
         self.latent_dist = latent_dist
+        self.device = device
+        self.K = latent_dim
 
-        self.embed = nn.Embedding(input_dim, hidden_dim)
-        self.lstm_cell = nn.LSTMCell(hidden_dim, hidden_dim)
+        self.action_embedding = nn.Embedding(action_dim, hidden_dim)
+        self.state_embedding = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.lstm_cell = nn.LSTMCell(2*hidden_dim, hidden_dim)
 
         # LSTM output heads.
-        self.head_z_1 = nn.Linear(hidden_dim, hidden_dim)  # Latents (z).
+        self.head_z_1 = nn.Linear(hidden_dim, hidden_dim)
 
         if latent_dist == 'gaussian':
             self.head_z_2 = nn.Linear(hidden_dim, latent_dim * 2)
@@ -47,8 +56,22 @@ class CompILE(nn.Module):
         self.head_b_2 = nn.Linear(hidden_dim, 1)
 
         # Decoder MLP.
-        self.decode_1 = nn.Linear(latent_dim, hidden_dim)
-        self.decode_2 = nn.Linear(hidden_dim, input_dim)
+        self.state_embedding_decoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.subpolicies = [
+            nn.Linear(hidden_dim, action_dim).to(device) for i in range(latent_dim)
+        ]
+
+    def embed_input(self, inputs):
+        state_embedding = self.state_embedding(inputs[0])
+        action_embedding = self.action_embedding(inputs[1])
+
+        embedding = torch.cat([state_embedding, action_embedding], dim=-1)
+        return embedding
 
     def masked_encode(self, inputs, mask):
         """Run masked RNN encoder on input sequence."""
@@ -114,11 +137,12 @@ class CompILE(nn.Module):
 
         return logits_z, sample_z
 
-    def decode(self, sample_z, length):
+    def decode(self, sample_z, states):
         """Decode single time step from latents and repeat over full seq."""
-        hidden = F.relu(self.decode_1(sample_z))
-        pred = self.decode_2(hidden)
-        return pred.unsqueeze(1).repeat(1, length, 1)
+        embed = self.state_embedding_decoder(states)
+        subpolicies = torch.cat([subpolicy(embed).unsqueeze(-1) for subpolicy in self.subpolicies], dim=-1)
+        pred = (subpolicies * sample_z.unsqueeze(1).unsqueeze(1)).sum(dim=-1)
+        return pred
 
     def get_next_masks(self, all_b_samples):
         """Get RNN hidden state masks for next segment."""
@@ -134,11 +158,11 @@ class CompILE(nn.Module):
     def forward(self, inputs, lengths):
 
         # Embed inputs.
-        embeddings = self.embed(inputs)
+        embeddings = self.embed_input(inputs)
 
         # Create initial mask.
         mask = torch.ones(
-            inputs.size(0), inputs.size(1), device=inputs.device)
+            inputs[0].size(0), inputs[0].size(1), device=inputs[0].device)
 
         all_b = {'logits': [], 'samples': []}
         all_z = {'logits': [], 'samples': []}
@@ -168,7 +192,36 @@ class CompILE(nn.Module):
             all_masks.append(mask)
 
             # Decode current segment from latents (z).
-            reconstructions = self.decode(sample_z, length=inputs.size(1))
+            reconstructions = self.decode(sample_z, inputs[0])
             all_recs.append(reconstructions)
 
         return all_encs, all_recs, all_masks, all_b, all_z
+
+    def save(self, path):
+        checkpoint = {'model': self.state_dict()}
+        for i, subpolicy in enumerate(self.subpolicies):
+            checkpoint[f"subpolicy-{i}"] = subpolicy.state_dict()
+        torch.save(checkpoint, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path)
+        self.load_state_dict(checkpoint['model'])
+        for i, subpolicy in enumerate(self.subpolicies):
+            subpolicy.load_state_dict(checkpoint[f"subpolicy-{i}"])
+
+    def play_from_observation(self, option, obs):
+        with torch.no_grad():
+            state = torch.tensor(obs).unsqueeze(0).unsqueeze(0).to(self.device).float()
+            o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
+            o_vector[0, option] = 1
+            policy = self.decode(o_vector, state).cpu().numpy()
+            termination = 0.
+        return np.argmax(policy), termination
+
+    def get_policy_from_observation(self, option, obs):
+        with torch.no_grad():
+            state = torch.tensor(obs).unsqueeze(0).unsqueeze(0).to(self.device).float()
+            o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
+            o_vector[0, option] = 1
+            policy = F.softmax(self.decode(o_vector, state), dim=-1).cpu().numpy()
+        return policy
