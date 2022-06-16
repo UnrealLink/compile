@@ -64,13 +64,13 @@ class CompILE(nn.Module):
 
         # Decoder MLP.
         self.state_embedding_decoder = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            # nn.Linear(state_dim, hidden_dim),
+            # nn.ReLU(),
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.ReLU(),
         )
         self.subpolicies = nn.ModuleList(
-            [nn.Linear(hidden_dim, action_dim).to(device) for _ in range(latent_dim)]
+            [nn.Linear(state_dim, action_dim).to(device) for _ in range(latent_dim)]
         )
 
         self.high_level_posterior = StickBreakingKumaraswamy(latent_dim, device)
@@ -214,13 +214,15 @@ class CompILE(nn.Module):
         return all_encs, all_recs, all_masks, all_b, all_z, eta, pre_sb_eta
 
     def save(self, path):
-        checkpoint = {'model': self.state_dict()}
+        checkpoint = {'model': self.state_dict(), 'latent_dim': self.latent_dim}
         for i, subpolicy in enumerate(self.subpolicies):
             checkpoint[f"subpolicy-{i}"] = subpolicy.state_dict()
         torch.save(checkpoint, path)
 
     def load(self, path):
         checkpoint = torch.load(path)
+        for _ in range(checkpoint['latent_dim']-self.latent_dim):
+            self.add_option(None)
         self.load_state_dict(checkpoint['model'])
         for i, subpolicy in enumerate(self.subpolicies):
             subpolicy.load_state_dict(checkpoint[f"subpolicy-{i}"])
@@ -243,14 +245,32 @@ class CompILE(nn.Module):
         return policy
 
     def add_option(self, optimizer):
-        self.subpolicies.append(nn.Linear(self.hidden_dim, self.action_dim).to(self.device))
+        self.subpolicies.append(nn.Linear(self.state_dim, self.action_dim).to(self.device))
         self.head_z_1.append(nn.Parameter(torch.empty(self.hidden_dim, 1, device=self.device)))
         nn.init.xavier_normal_(self.head_z_1[-1])
         self.head_z_2.append(nn.Linear(self.hidden_dim, 1).to(self.device))
         self.high_level_posterior.add_option(optimizer)
         self.latent_dim += 1
-        optimizer.add_param_group({"params" : self.subpolicies[-1].parameters()})
-        optimizer.add_param_group({"params" : self.head_z_2[-1].parameters()})
+        self.K = self.latent_dim
+        if optimizer is not None:
+            optimizer.add_param_group({"params" : self.subpolicies[-1].parameters()})
+            optimizer.add_param_group({"params" : self.head_z_2[-1].parameters()})
+
+    def evaluate_score(self, states, actions):
+        with torch.no_grad():
+            o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
+            o_vector[0, 0] = 1
+            policy = self.decode(o_vector, states)
+            policy = policy.view(-1, policy.shape[-1]).cpu().numpy()
+            max_probs = np.take_along_axis(policy, actions.view((-1, 1)).cpu().numpy(), 1).reshape(-1)
+            for option in range(1, self.latent_dim):
+                o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
+                o_vector[0, option] = 1
+                policy = self.decode(o_vector, states)
+                policy = policy.view(-1, policy.shape[-1]).cpu().numpy()
+                prob = np.take_along_axis(policy, actions.view((-1, 1)).cpu().numpy(), 1).reshape(-1)
+                max_probs = np.maximum(max_probs, prob)
+        return np.mean(max_probs)
 
 
 class StickBreakingKumaraswamy(nn.Module):
@@ -273,7 +293,8 @@ class StickBreakingKumaraswamy(nn.Module):
     def add_option(self, optimizer):
         self.log_kuma_params.append(nn.Parameter(torch.randn(1, 2, device=self.device)))
         self.K += 1
-        optimizer.add_param_group({"params" : self.log_kuma_params[-1]})
+        if optimizer is not None:
+            optimizer.add_param_group({"params" : self.log_kuma_params[-1]})
 
     def compute_kl(self, k=None, pre_sb=None, eps=10e-6):
         # returns an approximation of the KL between the product of Kumaraswamys and a product of Betas(1, alpha)
