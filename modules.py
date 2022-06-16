@@ -38,7 +38,7 @@ class CompILE(nn.Module):
         self.state_embedding = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
         )
         self.lstm_cell = nn.LSTMCell(2*hidden_dim, hidden_dim)
 
@@ -57,14 +57,17 @@ class CompILE(nn.Module):
 
         # Decoder MLP.
         self.state_embedding_decoder = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            # nn.Linear(state_dim, hidden_dim),
+            # nn.ReLU(),
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.ReLU(),
         )
-        self.subpolicies = [
-            nn.Linear(hidden_dim, action_dim).to(device) for i in range(latent_dim)
-        ]
+        self.subpolicies = [nn.Sequential(
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.ReLU(),
+            nn.Linear(state_dim, action_dim),
+            nn.Softmax(dim=-1),
+        ).to(device) for i in range(latent_dim)]
 
     def embed_input(self, inputs):
         state_embedding = self.state_embedding(inputs[0])
@@ -218,10 +221,18 @@ class CompILE(nn.Module):
             termination = 0.
         return np.argmax(policy), termination
 
-    def get_policy_from_observation(self, option, obs):
+    def evaluate_score(self, states, actions):
         with torch.no_grad():
-            state = torch.tensor(obs).unsqueeze(0).unsqueeze(0).to(self.device).float()
             o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
-            o_vector[0, option] = 1
-            policy = F.softmax(self.decode(o_vector, state), dim=-1).cpu().numpy()
-        return policy
+            o_vector[0, 0] = 1
+            policy = self.decode(o_vector, states)
+            policy = policy.view(-1, policy.shape[-1]).cpu().numpy()
+            max_probs = np.take_along_axis(policy, actions.view((-1, 1)).cpu().numpy(), 1).reshape(-1)
+            for option in range(1, self.latent_dim):
+                o_vector = torch.zeros(1, self.latent_dim).to(self.device).float()
+                o_vector[0, option] = 1
+                policy = self.decode(o_vector, states)
+                policy = policy.view(-1, policy.shape[-1]).cpu().numpy()
+                prob = np.take_along_axis(policy, actions.view((-1, 1)).cpu().numpy(), 1).reshape(-1)
+                max_probs = np.maximum(max_probs, prob)
+        return np.mean(max_probs)

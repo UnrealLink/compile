@@ -7,10 +7,6 @@ import numpy as np
 EPS = 1e-17
 NEG_INF = -1e30
 
-def stable_log(x, eps=10e-6):
-    # logs are slightly modified for numerical stability
-    # return torch.log(torch.clamp(x, min=eps))
-    return torch.log(torch.add(x, eps))
 
 def to_one_hot(indices, max_index):
     """Get one-hot encoding of index tensors."""
@@ -103,7 +99,7 @@ def get_segment_probs(all_b_samples, all_masks, segment_id):
         return neg_cumsum
 
 
-def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, beta_entropy=5., prior_rate=3.,):
+def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, prior_rate=3.,):
     """Get losses (NLL, KL divergences and neg. ELBO).
 
     Args:
@@ -144,18 +140,13 @@ def get_losses(inputs, outputs, args, beta_b=.1, beta_z=.1, beta_entropy=5., pri
 
     # KL divergence on b (first segment only, ignore first time step).
     # TODO(tkipf): Implement alternative prior on soft segment length.
-    if args.num_segments > 1:
-        probs_b = F.softmax(all_b['logits'][0], dim=-1)
-        log_prior_b = poisson_categorical_log_prior(
-            probs_b.size(1), prior_rate, device=inputs[0].device)
-        kl_b = model.num_segments * kl_categorical(
-            probs_b[:, 1:], log_prior_b[:, 1:]).mean(0)
-    else:
-        kl_b = 0
+    probs_b = F.softmax(all_b['logits'][0], dim=-1)
+    log_prior_b = poisson_categorical_log_prior(
+        probs_b.size(1), prior_rate, device=inputs[0].device)
+    kl_b = args.num_segments * kl_categorical(
+        probs_b[:, 1:], log_prior_b[:, 1:]).mean(0)
 
-    entropy = torch.sum(all_z['samples'][0].mean(0) * stable_log(all_z['samples'][0].mean(0)))
-
-    loss = nll + beta_z * kl_z + beta_b * kl_b + beta_entropy * entropy
+    loss = nll + beta_z * kl_z + beta_b * kl_b
     return loss, nll, kl_z, kl_b
 
 
